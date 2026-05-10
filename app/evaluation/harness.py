@@ -124,7 +124,7 @@ class EvalHarness:
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     text("""INSERT INTO eval_results (id, run_id, test_case_id, job_id, scores, passed, raw_outputs)
-                            VALUES (:id, :run_id, :tc_id, :job_id, :scores::jsonb, :passed, :raw::jsonb)"""),
+                            VALUES (:id, :run_id, :tc_id, :job_id, cast(:scores as jsonb), :passed, cast(:raw as jsonb))"""),
                     {
                         "id": str(uuid4()), "run_id": str(run_id), "tc_id": str(tc_id),
                         "job_id": str(job_id), "scores": json.dumps(scores, default=str),
@@ -144,7 +144,7 @@ class EvalHarness:
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     text("""INSERT INTO eval_results (id, run_id, test_case_id, job_id, scores, passed)
-                            VALUES (:id, :run_id, :tc_id, :job_id, :scores::jsonb, false)"""),
+                            VALUES (:id, :run_id, :tc_id, :job_id, cast(:scores as jsonb), false)"""),
                     {
                         "id": str(uuid4()), "run_id": str(run_id), "tc_id": str(tc_id),
                         "job_id": str(job_id),
@@ -196,7 +196,7 @@ class EvalHarness:
 
             await session.execute(
                 text("""UPDATE eval_runs SET status = 'completed', completed_at = NOW(),
-                        summary = :summary::jsonb WHERE id = :id"""),
+                        summary = cast(:summary as jsonb) WHERE id = :id"""),
                 {"id": str(run_id), "summary": json.dumps(summary)},
             )
             await session.commit()

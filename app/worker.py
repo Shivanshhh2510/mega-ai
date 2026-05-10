@@ -18,29 +18,41 @@ async def process_eval_runs():
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # Find running eval runs that need processing
+                # Find eval runs that are still 'running' and have no results yet
                 result = await session.execute(
-                    text("""SELECT er.id, el.metadata
-                            FROM eval_runs er
-                            JOIN execution_logs el ON el.job_id = er.id
-                            WHERE er.status = 'running'
-                            AND el.event_type = 'eval_run_requested'
+                    text("""SELECT id, run_type FROM eval_runs
+                            WHERE status = 'running'
                             AND NOT EXISTS (
-                                SELECT 1 FROM eval_results WHERE run_id = er.id
+                                SELECT 1 FROM eval_results WHERE run_id = eval_runs.id
                             )
-                            ORDER BY er.started_at ASC LIMIT 1""")
+                            ORDER BY started_at ASC LIMIT 1""")
                 )
                 row = result.fetchone()
 
             if row:
                 run_id = row[0]
-                meta_raw = row[1]
-                metadata = meta_raw if isinstance(meta_raw, dict) else json.loads(meta_raw) if meta_raw else {}
+                run_type = row[1]
 
-                logger.info("worker_processing_eval", run_id=str(run_id))
+                logger.info("worker_processing_eval", run_id=str(run_id), run_type=run_type)
 
-                if metadata.get("run_type") == "targeted" and metadata.get("test_case_ids"):
-                    await harness.run_targeted_eval(UUID(str(run_id)), metadata["test_case_ids"])
+                if run_type == "targeted":
+                    # Look up targeted test case IDs from the log
+                    async with AsyncSessionLocal() as session:
+                        log_result = await session.execute(
+                            text("""SELECT metadata FROM execution_logs
+                                    WHERE event_type = 'eval_run_requested'
+                                    AND message LIKE :pattern
+                                    ORDER BY timestamp DESC LIMIT 1"""),
+                            {"pattern": f"%{str(run_id)}%"},
+                        )
+                        log_row = log_result.fetchone()
+                        meta_data = json.loads(log_row[0]) if log_row and log_row[0] else {}
+                        test_case_ids = meta_data.get("test_case_ids", [])
+
+                    if test_case_ids:
+                        await harness.run_targeted_eval(UUID(str(run_id)), test_case_ids)
+                    else:
+                        await harness.run_full_eval(UUID(str(run_id)))
                 else:
                     await harness.run_full_eval(UUID(str(run_id)))
 

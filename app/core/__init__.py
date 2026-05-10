@@ -1,4 +1,5 @@
 import hashlib
+import json
 import time
 import structlog
 from datetime import datetime, timezone
@@ -70,7 +71,7 @@ class ExecutionLogger:
                         "latency_ms": latency_ms,
                         "token_count": token_count,
                         "policy_violation": policy_violation,
-                        "metadata": str(metadata or {}),
+                        "metadata": json.dumps(metadata or {}, default=str),
                         "message": message,
                     }
                 )

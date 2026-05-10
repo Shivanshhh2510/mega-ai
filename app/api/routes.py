@@ -345,12 +345,11 @@ async def trigger_eval(targeted: bool = False, test_case_ids: list[str] = None):
     # Store the request for the worker to pick up
     async with AsyncSessionLocal() as session:
         await session.execute(
-            text("""INSERT INTO execution_logs (job_id, event_type, message, metadata)
-                    VALUES (:id, 'eval_run_requested', :msg, :meta::jsonb)"""),
+            text("""INSERT INTO execution_logs (event_type, message, metadata)
+                    VALUES ('eval_run_requested', :msg, cast(:meta as jsonb))"""),
             {
-                "id": str(run_id),
-                "msg": f"Eval run {run_type} requested",
-                "meta": json.dumps({"test_case_ids": test_case_ids or [], "run_type": run_type}),
+                "msg": f"Eval run {run_type} requested with run_id {str(run_id)}",
+                "meta": json.dumps({"test_case_ids": test_case_ids or [], "run_type": run_type, "run_id": str(run_id)}),
             },
         )
         await session.commit()
