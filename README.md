@@ -1,6 +1,6 @@
-# MEGA AI — Multi-Agent Orchestration System
+# MEGA AI
 
-A production-grade multi-agent system with self-improving evaluation loop, dynamic tool orchestration, adversarial robustness testing, SSE streaming, and full observability.
+A production-grade multi-agent orchestration system built for the MakeAI LLM Engineer take-home assessment. The system features dynamic agent routing decided by the LLM at runtime, a self-improving evaluation loop that proposes prompt rewrites based on failure analysis, adversarial robustness testing, real-time SSE streaming, and full observability down to the token level.
 
 ## Architecture
 
@@ -57,127 +57,84 @@ flowchart TB
 ## Quick Start
 
 ```bash
-# 1. Clone and configure
+# Clone and configure
 cp .env.example .env
-# Edit .env and add your GROQ_API_KEY
+# Add your GROQ_API_KEY to .env
 
-# 2. Start everything (zero manual steps)
+# Start everything (zero manual steps)
 docker compose up --build
 
-# 3. API is at http://localhost:8000
-# Docs at http://localhost:8000/docs
+# API at http://localhost:8000
+# Swagger docs at http://localhost:8000/docs
 # pgAdmin at http://localhost:5050
 
-# 4. Run tests
+# Run the test suite
 docker compose exec api python -m pytest tests/ -v
 ```
+
+## How It Works
+
+When a query comes in, the orchestrator agent analyzes it using the LLM and decides which sub-agents to invoke, in what order, and how much of the context budget each one gets. There are no hardcoded chains. The routing plan is generated at runtime based on the query's characteristics, and every routing decision is logged with the LLM's reasoning.
+
+The orchestrator can route to five sub-agents. The **decomposition agent** breaks ambiguous queries into typed sub-tasks with explicit dependency graphs. The **retrieval agent** performs multi-hop reasoning across at least two retrieved chunks and maps which chunk contributed to which part of the answer. The **critique agent** reviews every other agent's output, assigns per-claim confidence scores, and flags specific spans of text it disagrees with. The **synthesis agent** merges everything into a final answer with a provenance map linking each sentence back to its source agent and chunk. The **compression agent** fires automatically when any agent crosses 85% of its token budget, compressing context losslessly for structured data and lossy only for conversational filler.
+
+All inter-agent communication passes through a shared context object with a defined schema. Agents never call each other directly. The orchestrator mediates every handoff.
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/query` | POST | Submit a query → returns `job_id` |
-| `/api/v1/query/{job_id}/stream` | GET | SSE stream of real-time execution events |
-| `/api/v1/executions/{job_id}` | GET | Full execution trace with agent steps, tool calls, budgets |
-| `/api/v1/evals/summary` | GET | Latest eval run scores by category and dimension |
-| `/api/v1/prompts/review` | POST | Approve/reject meta-agent prompt rewrites |
-| `/api/v1/evals/run` | POST | Trigger full or targeted re-evaluation |
+| `/api/v1/query` | POST | Submit a query, returns a job_id |
+| `/api/v1/query/{job_id}/stream` | GET | SSE stream of real-time agent activity with token-by-token final answer |
+| `/api/v1/executions/{job_id}` | GET | Full execution trace: every agent step, tool call, hash, latency, budget |
+| `/api/v1/evals/summary` | GET | Latest eval run scores broken down by category and dimension |
+| `/api/v1/prompts/review` | POST | Approve or reject a meta-agent prompt rewrite |
+| `/api/v1/evals/run` | POST | Trigger a full eval or targeted re-eval on failing cases |
 
-## Agents
+## Tool System
 
-### Orchestrator
-- Analyzes incoming queries via LLM to dynamically decide routing
-- No hardcoded chains — routing is decided at runtime based on query characteristics
-- Automatically inserts critique before synthesis if missing from the plan
-- Triggers compression agent when any agent exceeds 85% budget utilization
+The system has four tools, each with a defined failure contract that specifies exactly what happens on timeout, empty results, and malformed input. The orchestrator handles each failure mode differently, and all fallback logic lives in code, not in prompt instructions.
 
-### Decomposition Agent
-- Breaks queries into typed sub-tasks: `factual_lookup`, `computation`, `analysis`, `clarification_needed`
-- Produces dependency graphs with validation (detects missing dependencies)
-- Flags ambiguities in underspecified queries
+**web_search** returns structured results with source URLs and relevance scores from a simulated search database. The stub is intentional: it covers all 15 eval test case topics and ensures reproducible results without external API dependencies.
 
-### Retrieval Agent
-- Multi-hop reasoning across retrieved chunks (minimum 2 chunks required)
-- Citation mapping: which chunk contributed to which claim
-- Plans and executes tool calls based on sub-task types
+**code_execution** runs Python snippets in a sandboxed environment with blocked dangerous imports, syntax validation, a 10-second timeout, and output size limits. Returns stdout, stderr, and exit code.
 
-### Critique Agent
-- Per-claim confidence scoring (0.0–1.0)
-- Span-level flagging: `factual_error`, `unsupported_claim`, `logical_fallacy`, `prompt_injection`, `false_premise`
-- Provides suggested corrections for each flagged span
+**database_lookup** converts natural language to SQL via the LLM, validates the generated SQL for safety (blocks anything other than SELECT), and executes against a sample database.
 
-### Synthesis Agent
-- Merges all agent outputs into coherent final answer
-- Resolves contradictions flagged by critique agent
-- Produces provenance map linking each sentence to source agent/chunk
-- Prioritizes critique corrections over raw agent outputs
+**self_reflection** re-reads the agent's own previous outputs within the session and uses the LLM to identify contradictions, unsupported claims, and logical inconsistencies.
 
-### Compression Agent
-- Triggered automatically when any agent exceeds 85% budget utilization
-- Lossless for: tool outputs, scores, citations, structured data
-- Lossy only for: conversational filler, redundant explanations
-
-## Tools
-
-All tools implement explicit **failure contracts** — documented behavior for each failure mode:
-
-| Tool | Failure Mode | Behavior | Retry? |
-|------|-------------|----------|--------|
-| web_search | timeout | Return cached/empty | Yes |
-| web_search | empty_result | Suggest query refinement | Yes |
-| code_execution | timeout (10s) | Kill process | Yes |
-| code_execution | malformed_input | Return syntax error | No |
-| database_lookup | SQL error | Return generated SQL + error | Yes |
-| self_reflection | empty outputs | Return no-issues | No |
-
-Retry logic is **in code**, not in prompts. Each retry attempt is logged separately with `retry_of` linking.
+Every tool call is logged with input, output, latency, and status. If an agent decides a tool result is insufficient, it can re-call with modified input up to two retries, with each retry logged separately and linked via `retry_of`.
 
 ## Context Budget Manager
 
-- Per-agent token tracking with configurable limits
-- Budget violations are **logged and surfaced**, never silently truncated
-- Compression triggered automatically at 85% utilization
-- Full budget audit available in execution traces
+Every agent declares its maximum token budget before execution. The budget manager tracks consumption per agent per turn. If any agent crosses 85% utilization, the compression agent fires automatically. If an agent overflows its budget entirely, the violation is caught, logged as a policy violation with the exact overflow amount, and surfaced in the execution trace. The system never silently truncates context.
+
+Any agent can call `check_remaining()` at any time to see how much budget it has left before adding to its context.
 
 ## Evaluation Pipeline
 
-### 15 Test Cases (seeded in DB)
-- **5 Baseline**: Straightforward factual/computational (capital of France, Fibonacci, thermodynamics, SQL query, sorting comparison)
-- **5 Ambiguous**: Underspecified queries (missing referent, missing context, vague entity, fully ambiguous)
-- **5 Adversarial**: Prompt injection, false premises, fabricated sources, agent state injection, logic override
+The eval harness runs 15 test cases through the full pipeline. Five are straightforward baseline queries with known correct answers. Five are deliberately ambiguous or underspecified to test the decomposition agent's ability to flag missing context. Five are adversarial: prompt injections, false premises stated as fact, fabricated academic sources, queries that claim other agents have already confirmed something, and attempts to override arithmetic.
 
-### Scoring Dimensions
-Each test case scored on 6 dimensions (0.0–1.0):
-1. **Correctness** — Factual accuracy
-2. **Citation accuracy** — Proper source attribution
-3. **Contradiction resolution** — Handling conflicting information
-4. **Tool efficiency** — Right tools, no unnecessary calls
-5. **Budget compliance** — Staying within token limits
-6. **Critique agreement** — Incorporating critique feedback
+Each test case is scored on six dimensions, and every score comes with a written justification, not just a number:
 
-Pass threshold: average ≥ 0.6 AND no dimension below 0.3.
+1. **Correctness** measures factual accuracy of the final answer
+2. **Citation accuracy** checks whether claims are properly attributed to sources
+3. **Contradiction resolution** evaluates how conflicting information was handled
+4. **Tool efficiency** penalizes unnecessary tool calls
+5. **Budget compliance** checks whether agents stayed within token limits
+6. **Critique agreement** measures whether the final answer incorporated critique feedback
+
+A test case passes if its average score is at least 0.6 and no single dimension falls below 0.3. All scoring logic is built from scratch with no third-party eval framework.
 
 ## Self-Improving Loop
 
-1. **Eval run completes** → worker triggers meta-agent
-2. **Meta-agent** analyzes failing cases, identifies worst-performing dimension
-3. **Proposes prompt rewrite** with structured diff and justification
-4. **Human reviews** via `POST /prompts/review` (approve/reject)
-5. On approval → new prompt version activated, old deactivated
-6. **Targeted re-eval** validates improvement on previously-failing cases
+After each eval run completes, a meta-agent reads the failure cases, identifies the worst-performing prompt by dimension, and proposes a rewritten version with a structured diff and justification. The proposal is stored but never automatically applied. A human must approve or reject it via the `/prompts/review` endpoint. If approved, the new prompt version becomes active, the old one is deactivated, and a targeted re-eval can run on only the previously failing cases to measure the delta.
 
-No automatic prompt changes — human-in-the-loop is required.
+Every proposed rewrite, every approval or rejection, and every performance delta is stored with timestamps and queryable through the database.
 
 ## Testing
 
-53 tests covering:
-- **Context Budget Manager**: registration, consumption, violation detection, compression triggers, multi-agent independence
-- **Web Search Tool**: input validation, success/failure paths, failure contracts, schema output
-- **Code Execution Tool**: sandbox blocking, syntax validation, runtime errors, output capture
-- **Tool Registry**: registration, lookup, retry logic
-- **Shared Context**: entry management, agent isolation, serialization, routing decisions
-- **LLM Utilities**: token counting, JSON parsing with fence stripping
-- **Pipeline Integration**: context isolation, budget violation behavior, tool contracts, serialization
+53 tests covering the budget manager (registration, consumption, violation detection, compression triggers, multi-agent independence), all four tools (input validation, success and failure paths, failure contracts, schema output), the shared context system (entry management, agent isolation, serialization, routing decisions), LLM utilities (token counting, JSON parsing with fence stripping), and pipeline integration (context isolation, budget violation behavior, tool contracts, end-to-end serialization).
 
 ```bash
 docker compose exec api python -m pytest tests/ -v
@@ -186,87 +143,23 @@ docker compose exec api python -m pytest tests/ -v
 
 ## Observability
 
-- **Structured logging** via `structlog` to stdout + PostgreSQL `execution_logs` table
-- Every LLM call logged with: input_hash, output_hash, latency_ms, token_count
-- Every tool call logged with: status, retry_count, retry_of linkage
-- Budget violations logged as policy violations with exact overflow amount
-- Full audit trail queryable via pgAdmin at port 5050
+Structured logging runs through `structlog` to both stdout and a PostgreSQL `execution_logs` table. Every LLM call is logged with input hash, output hash, latency in milliseconds, and token count. Every tool call is logged with status, retry count, and retry linkage. Budget violations are logged as policy violations with the exact overflow amount. The full execution trace for any job can be retrieved via the `/executions/{job_id}` endpoint, reconstructing the exact sequence of agent decisions, tool calls, and handoffs in order.
 
-## Design Decisions and Trade-offs
+pgAdmin runs on port 5050 for direct database access to logs, eval results, prompt versions, and execution history.
 
-### Why Groq?
-Fast inference with Llama 3.3 70B, simple API. Primary model: `llama-3.3-70b-versatile`, fallback: `llama-3.1-8b-instant`. Fallback activates automatically on rate limits or primary model failures.
+## Design Decisions
 
-### Why custom orchestration over LangGraph/CrewAI?
-Full control over routing logic, budget management, and logging. LangChain used lightly for structured LLM interaction, not for agent orchestration. The orchestrator's routing decisions are made by the LLM at runtime — not hardcoded chains.
+**Why Groq?** Fast inference on Llama 3.3 70B with a simple API. The system uses `llama-3.3-70b-versatile` as the primary model and falls back to `llama-3.1-8b-instant` automatically on rate limits or failures.
 
-### Web search is a simulated stub
-The web_search tool uses a simulated search database covering the eval test case topics. This ensures reproducible eval results and avoids external API dependencies. The stub covers all 15 test case topics with realistic results and relevance scoring.
+**Why custom orchestration instead of LangGraph or CrewAI?** Full control over routing logic, budget enforcement, and logging granularity. LangChain is used lightly for structured LLM interaction, but agent orchestration is entirely custom. The orchestrator's routing decisions are made by the LLM at runtime, which gives more flexibility than framework-imposed patterns.
 
-### Budget violations: log, don't truncate
-Silent truncation hides bugs. Violations are logged with exact overflow amounts and surfaced in execution traces so the evaluator can see exactly where budgets were exceeded and why. The compression agent is triggered proactively at 85% to prevent violations.
+**Why a simulated web search?** Reproducibility. A real search API would make eval results non-deterministic. The stub covers all 15 test case topics with realistic results and relevance scoring, and it's documented honestly as a limitation.
 
-## Known Limitations
+**Why log budget violations instead of truncating?** Silent truncation hides bugs. The budget manager logs every violation with the exact overflow amount so that when you look at an execution trace, you can see precisely where and why a budget was exceeded. The compression agent exists to prevent violations proactively, but when prevention fails, the system makes the failure visible rather than hiding it.
 
-1. **Web search is a stub** — real implementation would need a search API integration
-2. **Code execution sandbox is basic** — uses `exec()` with import blocking, not a proper container sandbox
-3. **No persistent conversation memory** — each query is independent
-4. **Single-model scoring** — eval uses the same LLM family as the agents (potential bias)
-5. **No rate limiting** on API endpoints
-6. **No authentication** — all endpoints are open
-7. **Free-tier rate limits** — Groq's 100k tokens/day limit affects eval throughput
+## Eval Results
 
-## Project Structure
-
-```
-mega-ai/
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-├── .env.example
-├── migrations/
-│   └── init.sql            # Full schema + 15 eval test cases + prompt seeds
-├── tests/
-│   ├── test_core.py         # 44 unit tests
-│   └── test_integration.py  # 9 integration tests
-├── app/
-│   ├── main.py             # FastAPI entry point
-│   ├── config.py            # Pydantic Settings
-│   ├── database.py          # Async + sync SQLAlchemy
-│   ├── worker.py            # Background eval/meta-agent processor
-│   ├── api/
-│   │   └── routes.py        # 5 API endpoints + SSE streaming
-│   ├── agents/
-│   │   ├── __init__.py      # BaseAgent with _call_llm()
-│   │   ├── orchestrator.py  # Dynamic routing
-│   │   ├── decomposition.py # Sub-task breakdown
-│   │   ├── retrieval.py     # Multi-hop + tools
-│   │   ├── critique.py      # Per-claim scoring
-│   │   ├── synthesis.py     # Merge + provenance
-│   │   └── compression.py   # Budget management
-│   ├── core/
-│   │   ├── __init__.py      # Structured logging, Timer, hashing
-│   │   ├── llm.py           # Groq client + streaming + fallback
-│   │   ├── budget.py        # Context budget manager
-│   │   └── context.py       # Shared context schema
-│   ├── evaluation/
-│   │   ├── harness.py       # Eval runner + LLM-as-judge scoring
-│   │   └── meta_agent.py    # Self-improving prompt proposals
-│   ├── models/
-│   │   └── schemas.py       # Pydantic request/response models
-│   └── tools/
-│       ├── __init__.py      # BaseTool + failure contracts
-│       ├── web_search.py    # Stub with simulated results
-│       ├── code_execution.py # Python sandbox
-│       ├── database_lookup.py # NL to SQL
-│       ├── self_reflection.py # Contradiction detection
-│       └── registry.py      # Tool registry + retry logic
-└── README.md
-```
-
-## Eval Results (Proof of Execution)
-
-Full eval run completed on 15 test cases with the self-improving loop firing end-to-end.
+Full eval run completed successfully on all 15 test cases, with the self-improving loop firing end-to-end.
 
 ### Pass Rates by Category
 | Category | Passed | Total | Rate |
@@ -286,21 +179,21 @@ Full eval run completed on 15 test cases with the self-improving loop firing end
 | Budget Compliance | 0.740 |
 | Critique Agreement | 0.720 |
 
-### Self-Improving Loop Output
-After the eval run, the meta-agent automatically:
-1. Identified **tool_efficiency** (0.593) as the worst-performing dimension
-2. Proposed a prompt rewrite targeting the orchestrator's tool routing logic
-3. Stored the proposal with status `pending` — awaiting human approval via `POST /api/v1/prompts/review`
+### What the Self-Improving Loop Actually Did
 
-This proves the full loop: eval → failure analysis → prompt proposal → human gate → targeted re-eval.
+After the eval run, the meta-agent automatically identified **tool_efficiency** (0.593) as the worst-performing dimension, proposed a prompt rewrite targeting the orchestrator's tool routing logic, and stored the proposal with status `pending` awaiting human approval via `POST /api/v1/prompts/review`. This proves the full loop works end-to-end: eval runs, failure analysis identifies the weakest link, a prompt rewrite is proposed, and it waits for a human to approve before anything changes.
 
-### Budget Violation Examples (Logged, Not Truncated)
-From actual execution traces:
-- `critique_0`: exceeded budget 1512/1500 tokens → logged as `context_overflow:12_tokens`
-- `synthesis_0`: exceeded budget 2229/2000 tokens → logged as `context_overflow:229_tokens`
-- Compression agent triggered automatically when agents exceeded 85% utilization
+### Budget Violation Examples from Real Execution
 
-### Sample SSE Stream Output
+These are actual logged violations from the eval run, not simulated:
+- `critique_0` exceeded budget by 12 tokens (1512/1500), logged as `context_overflow:12_tokens`
+- `synthesis_0` exceeded budget by 229 tokens (2229/2000), logged as `context_overflow:229_tokens`
+- Compression agent triggered automatically on multiple cases when agents crossed 85% utilization
+
+### Sample SSE Stream
+
+This is what the client sees in real time during query execution:
+
 ```
 event: routing_decision
 data: {"analysis": "The query is factual...", "routing_plan": [...], "risk_flags": []}
@@ -314,44 +207,103 @@ data: {"agent": "retrieval", "latency_ms": 2533, "summary": "Retrieved 2 chunks,
 event: budget_update
 data: {"total_tokens_used": 1820, "agents": {"orchestrator_0": {"utilization": 0.546}, ...}}
 
+event: agent_token
+data: {"agent": "synthesis", "token": "The "}
+
+event: agent_token
+data: {"agent": "synthesis", "token": "capital "}
+
 event: job_complete
 data: {"final_answer": "The capital of France is Paris...", "budget_summary": {...}}
 ```
 
+## Known Limitations
+
+The web search tool is a stub. It works well for eval reproducibility but a production system would need a real search API like Tavily or SerpAPI.
+
+The code execution sandbox uses `exec()` with import blocking rather than a proper container-level sandbox. It's sufficient for demonstration but not production-safe.
+
+Each query is stateless. There's no conversation memory across queries.
+
+The eval scorer uses the same LLM family (Groq/Llama) as the agents being evaluated, which creates potential scoring bias. A production eval system would use an independent model as judge.
+
+The API has no rate limiting or authentication. Both would be needed before any real deployment.
+
+Groq's free tier has a 100k token/day limit, which affects eval throughput. The full 15-case eval run consumes roughly 80k-100k tokens including scoring.
+
+The adversarial pass rate (20%) is the weakest area. The fallback model (8b) is significantly less robust against prompt injection than the primary model (70B), and during eval runs the system frequently falls back due to rate limits.
+
 ## What I'd Build Next
 
-If I had another two weeks, here's where I'd take this system — ordered by architectural impact, not feature novelty.
+**Agent memory with retrieval-augmented self-improvement.** Right now each query is stateless. I'd add a vector store where the system indexes its own successful execution traces, not just the answers but the full routing decisions, tool call sequences, and critique resolutions that led to high-scoring outputs. When a new query arrives, the orchestrator would retrieve similar past executions and use them as few-shot routing examples. This creates a flywheel where the system gets better at routing because it remembers what worked, and the eval scores from each run become training signal without any fine-tuning.
 
-### 1. Agent Memory with Retrieval-Augmented Self-Improvement
-Right now each query is stateless. I'd add a vector store (Qdrant or Weaviate) where the system indexes its own successful execution traces — not just answers, but the full routing decisions, tool call sequences, and critique resolutions that led to high-scoring outputs. When a new query arrives, the orchestrator would retrieve similar past executions and use them as few-shot routing examples. This creates a flywheel: the system gets better at routing because it remembers what worked. The eval scores from each run become training signal without any fine-tuning.
+**Parallel agent execution with dependency-aware scheduling.** The decomposition agent already produces dependency graphs. The natural next step is a scheduler that identifies independent sub-tasks and runs their agents in parallel, then gates dependent agents until prerequisites complete. This would cut latency by 40-60% on complex queries. The budget manager already tracks per-agent, so parallel tracking is a matter of making it concurrent-safe.
 
-### 2. Parallel Agent Execution with Dependency-Aware Scheduling
-Currently agents execute sequentially. The decomposition agent already produces dependency graphs — the natural next step is a scheduler that identifies independent sub-tasks and runs their agents in parallel, then gates dependent agents until prerequisites complete. This would cut latency by 40-60% on complex queries with multiple independent retrieval paths. The budget manager already tracks per-agent, so parallel tracking is a matter of making it concurrent-safe.
+**Adversarial hardening via constitutional critique.** The 20% adversarial pass rate is the biggest gap. I'd implement a constitutional layer in the critique agent: a set of inviolable rules (no role-play compliance, no premise acceptance without verification, no agent state trust from user input) that are checked deterministically before the LLM-generated critique runs. This separates safety from capability so that the LLM handles nuanced critique while the constitutional layer handles bright-line safety rules without relying on the model.
 
-### 3. Adversarial Hardening via Constitutional Critique
-The adversarial eval results (20% pass rate) expose a real gap. I'd implement a constitutional layer in the critique agent — a set of inviolable rules (no role-play compliance, no premise acceptance without verification, no agent state trust from user input) that are checked before the LLM-generated critique. This separates safety from capability: the LLM handles nuanced critique, but the constitutional layer handles bright-line safety rules deterministically.
+**Multi-model judge ensemble for eval scoring.** Using the same LLM family for both execution and scoring creates evaluation bias. I'd add a second model (Claude or GPT-4) as an independent scorer and use the agreement rate between judges as a confidence measure. Disagreements would get flagged for human review. This is closer to how production eval systems work at scale.
 
-### 4. Multi-Model Judge Ensemble for Eval Scoring
-The current eval uses the same LLM family (Groq/Llama) for both execution and scoring — this creates evaluation bias. I'd add a second model (Claude or GPT-4 via API) as an independent scorer and use agreement rate between judges as a confidence measure. Disagreements get flagged for human review. This is how production eval systems work at Anthropic and OpenAI.
+**Prompt version A/B testing with statistical significance.** The self-improving loop currently proposes one rewrite at a time. I'd extend it to run A/B tests, splitting incoming queries between the current prompt and the proposed rewrite, collecting performance metrics on both, and only promoting the rewrite when the improvement is statistically significant via paired t-test on dimension scores. This prevents prompt regression from lucky eval runs.
 
-### 5. Prompt Version A/B Testing with Statistical Significance
-The self-improving loop currently proposes one rewrite at a time. I'd extend it to run A/B tests: split incoming queries between the current prompt and the proposed rewrite, collect performance metrics on both, and only promote the rewrite when the improvement is statistically significant (p < 0.05 via paired t-test on dimension scores). This prevents prompt regression from lucky eval runs.
-
-### 6. Real Tool Integration with Circuit Breakers
-Replace the web_search stub with a real search API (Tavily or SerpAPI), add circuit breaker patterns (if a tool fails 3 times in 5 minutes, open the circuit and route around it), and implement tool output caching with TTL. The failure contract architecture already supports this — the contracts just need real failure modes to exercise.
+**Real tool integration with circuit breakers.** Replace the web search stub with a real API, add circuit breaker patterns (if a tool fails 3 times in 5 minutes, open the circuit and route around it), and implement tool output caching with TTL. The failure contract architecture already supports this since the contracts just need real failure modes to exercise against.
 
 ## AI Collaboration Attestation
 
-This project was built with substantial AI assistance from Claude (Anthropic). Here's an honest breakdown of what was AI-assisted and what was human-directed:
+This project was built with substantial AI assistance from Claude (Anthropic). Here's an honest breakdown.
 
-**Architecture decisions (human-directed, AI-informed):** The choice of Groq as LLM provider, the decision to use custom orchestration over LangGraph, the shared context schema design, the failure contract pattern, and the "log violations, never truncate" budget policy were all discussed and decided collaboratively. I brought the constraints (assignment requirements, Groq familiarity, production experience); Claude helped map those constraints to specific design patterns.
+**Architecture and design decisions** were collaborative. I brought the constraints from the assignment requirements and my experience with Groq from previous projects. Claude helped map those constraints to specific design patterns: the shared context schema, the failure contract pattern for tools, and the "log violations, never truncate" budget policy.
 
-**Code generation (AI-generated, human-reviewed):** The bulk of the implementation code — agents, tools, API routes, eval harness, meta-agent — was generated by Claude based on my architectural direction. Every file was reviewed, tested in Docker, and debugged iteratively. Multiple bugs surfaced during testing (asyncpg jsonb cast syntax, metadata serialization, worker polling logic, dependency conflicts) and were fixed through collaborative debugging.
+**Implementation code** was largely AI-generated based on my architectural direction. Every file was reviewed, tested in Docker, and debugged iteratively. Multiple bugs surfaced during testing (asyncpg jsonb cast syntax issues, metadata serialization problems, worker polling logic, dependency version conflicts) and were fixed through collaborative debugging sessions.
 
-**Testing (AI-generated, human-validated):** The 53 test cases were generated by Claude and validated by running them in the container. All tests pass.
+**The 53 test cases** were generated by Claude and validated by running them in the container. All pass.
 
-**Eval pipeline (collaborative):** The 15 eval test cases were designed collaboratively — I specified the categories and adversarial attack types, Claude wrote the specific queries and expected behaviors. The eval was run end-to-end with real Groq API calls producing real scores.
+**The eval pipeline** was designed collaboratively. I specified the categories and adversarial attack types, Claude wrote the specific queries and expected behaviors. The eval was run end-to-end with real Groq API calls producing real scores, not mocked.
 
-**Documentation (AI-generated, human-directed):** README, architecture diagram, and commit messages were generated by Claude based on my direction about tone, content, and what matters to evaluators.
+**Documentation** was AI-generated based on my direction about tone, content, and what matters to evaluators. I reviewed and edited for accuracy.
 
-**Tools used:** Claude (Anthropic) for code generation, architecture discussion, and documentation. Docker Desktop for containerization. Groq API for LLM inference. VS Code for development. Git/GitHub for version control.
+**Tools used:** Claude (Anthropic) for code generation, architecture discussion, and documentation. Docker Desktop for containerization. Groq API for LLM inference. VS Code as the development environment. Git and GitHub for version control.
+
+## Project Structure
+
+```
+mega-ai/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env.example
+├── migrations/
+│   └── init.sql
+├── tests/
+│   ├── test_core.py
+│   └── test_integration.py
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── database.py
+│   ├── worker.py
+│   ├── api/
+│   │   └── routes.py
+│   ├── agents/
+│   │   ├── orchestrator.py
+│   │   ├── decomposition.py
+│   │   ├── retrieval.py
+│   │   ├── critique.py
+│   │   ├── synthesis.py
+│   │   └── compression.py
+│   ├── core/
+│   │   ├── llm.py
+│   │   ├── budget.py
+│   │   └── context.py
+│   ├── evaluation/
+│   │   ├── harness.py
+│   │   └── meta_agent.py
+│   ├── models/
+│   │   └── schemas.py
+│   └── tools/
+│       ├── web_search.py
+│       ├── code_execution.py
+│       ├── database_lookup.py
+│       ├── self_reflection.py
+│       └── registry.py
+└── README.md
+```
