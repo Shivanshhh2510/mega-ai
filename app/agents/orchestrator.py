@@ -184,9 +184,19 @@ class OrchestratorAgent(BaseAgent):
                 "data": budget_manager.get_all_status(),
             }
 
-        # Final result
+        # Final result — stream token by token
         synthesis_result = context.get_latest_entry(ContextType.SYNTHESIS_RESULT)
         final_answer = synthesis_result.payload.get("final_answer", "") if synthesis_result else ""
+
+        # Stream final answer token by token
+        if final_answer:
+            words = final_answer.split(" ")
+            for i, word in enumerate(words):
+                token = word + (" " if i < len(words) - 1 else "")
+                yield {
+                    "type": SSEEventType.AGENT_TOKEN,
+                    "data": {"agent": "synthesis", "token": token},
+                }
 
         yield {
             "type": SSEEventType.JOB_COMPLETE,
