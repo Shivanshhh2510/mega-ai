@@ -1,4 +1,4 @@
-# MEGA AI
+# Real-Time Multi-Agent LLM Orchestration and Evaluation System
 
 A production-grade multi-agent orchestration system built for the MakeAI LLM Engineer take-home assessment. The system features dynamic agent routing decided by the LLM at runtime, a self-improving evaluation loop that proposes prompt rewrites based on failure analysis, adversarial robustness testing, real-time SSE streaming, and full observability down to the token level.
 
